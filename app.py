@@ -7,19 +7,20 @@ import os
 
 app = Flask(__name__)
 
-# Configuración CORS
+# CONFIGURACIÓN CORS (Permisos totales)
 CORS(app, resources={r"/*": {
     "origins": "*",
     "methods": ["GET", "POST", "OPTIONS"],
-    "allow_headers": ["Content-Type"]
+    "allow_headers": ["Content-Type", "Authorization"]
 }})
 
 # --- RUTAS ---
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-# Cargamos solo el pipeline (que ya incluye Scaler + Imputer + Modelo)
 MODEL_PATH = os.path.join(BASE_DIR, 'modelo/random_forest_model.pkl')
+SCALER_PATH = os.path.join(BASE_DIR, 'modelo/scaler.pkl')
 
-pipeline = None
+model = None
+scaler = None
 
 KEYS_MAPPING = {
     'embarazos': 'Pregnancies',
@@ -32,29 +33,32 @@ KEYS_MAPPING = {
     'edad': 'Age'
 }
 
-def load_model():
-    global pipeline
+def load_model_and_scaler():
+    global model, scaler
     try:
-        pipeline = joblib.load(MODEL_PATH)
-        print("Pipeline cargado correctamente.")
+        # Cargamos AMBOS archivos (Esto es lo que falló antes al intentar cargar solo uno)
+        model = joblib.load(MODEL_PATH)
+        scaler = joblib.load(SCALER_PATH)
+        print("✅ Modelo y Escalador cargados correctamente.")
     except Exception as e:
-        print(f"Error cargando modelo: {e}")
+        print(f"❌ Error fatal cargando archivos: {e}")
 
-load_model()
+load_model_and_scaler()
 
 @app.route('/', methods=['GET'])
 def home():
-    return jsonify({"status": "API Online"})
+    return jsonify({"status": "API Online - Modo Recuperación"})
 
 @app.route('/predict', methods=['POST'])
 def predict():
-    if not pipeline:
-        return jsonify({"error": "Modelo no cargado"}), 500
+    # Chequeo de seguridad
+    if not model or not scaler:
+        return jsonify({"error": "El servidor no pudo cargar los modelos .pkl"}), 500
 
     try:
         data = request.get_json(force=True)
         
-        # 1. TRADUCIR CLAVES (Español -> Inglés)
+        # 1. TRADUCIR Y PREPARAR
         data_translated = {}
         expected_features = ['Pregnancies', 'Glucose', 'BloodPressure', 'SkinThickness', 'Insulin', 'BMI', 'DiabetesPedigreeFunction', 'Age']
         
@@ -62,32 +66,39 @@ def predict():
             english_key = KEYS_MAPPING.get(key, key)
             data_translated[english_key] = float(value)
 
-        # 2. VALIDAR CAMPOS FALTANTES
+        # 2. VALIDAR FALTANTES
         for feature in expected_features:
             if feature not in data_translated:
-                data_translated[feature] = np.nan 
+                data_translated[feature] = 0  # Valor por defecto seguro
 
         # 3. CREAR DATAFRAME
         input_df = pd.DataFrame([data_translated], columns=expected_features)
-        
-        # --- MEJORA CRÍTICA BASADA EN TU ARCHIVO ANTIGUO ---
-        # Estas son las columnas donde un 0 es biológicamente imposible.
-        # En tu archivo viejo, las identificabas pero usabas 'pass'.
-        # AQUÍ las convertimos a NaN para que el Pipeline las arregle matemáticamente.
-        cols_bad_zeros = ['Glucose', 'BloodPressure', 'SkinThickness', 'Insulin', 'BMI']
-        
-        for col in cols_bad_zeros:
-            val = input_df[col].iloc[0]
-            if val == 0:
-                # Transformamos 0 -> NaN. El Pipeline (SimpleImputer) verá el NaN 
-                # y le pondrá el valor promedio automáticamente.
-                input_df[col].iloc[0] = np.nan
 
-        # NOTA: 'Pregnancies' NO está en la lista. Si es 0, se queda en 0 (es válido).
+        # --- TRUCO CLÍNICO (Imputación Manual) ---
+        # Como no pudimos reentrenar, hacemos esto para mejorar la precisión AHORA MISMO.
+        # Si un valor es 0 (y no debería serlo), le ponemos el promedio de una persona promedio.
+        
+        # Glucosa 0 -> 120 (Promedio riesgo)
+        if input_df['Glucose'].iloc[0] == 0: input_df['Glucose'].iloc[0] = 120.0
+        
+        # Presión 0 -> 72 (Normal)
+        if input_df['BloodPressure'].iloc[0] == 0: input_df['BloodPressure'].iloc[0] = 72.0
+        
+        # Piel 0 -> 29 (Mediana)
+        if input_df['SkinThickness'].iloc[0] == 0: input_df['SkinThickness'].iloc[0] = 29.0
+        
+        # BMI 0 -> 32 (Promedio de sobrepeso del dataset)
+        if input_df['BMI'].iloc[0] == 0: input_df['BMI'].iloc[0] = 32.0
+        
+        # Insulina: Si es 0 es difícil saber, lo dejamos o ponemos un valor bajo-medio
+        if input_df['Insulin'].iloc[0] == 0: input_df['Insulin'].iloc[0] = 80.0 # Opcional
 
-        # 4. PREDECIR
-        prediction_class = pipeline.predict(input_df)[0]
-        prediction_prob = pipeline.predict_proba(input_df)[0]
+        # 4. ESCALAR (Usando el scaler viejo que sí tienes)
+        scaled_input = scaler.transform(input_df)
+
+        # 5. PREDECIR
+        prediction_class = model.predict(scaled_input)[0]
+        prediction_prob = model.predict_proba(scaled_input)[0] # [Prob_Sano, Prob_Enfermo]
 
         result = {
             "prediction": int(prediction_class),
@@ -98,6 +109,7 @@ def predict():
         return jsonify(result), 200
 
     except Exception as e:
+        print(f"Error interno: {e}")
         return jsonify({"error": str(e)}), 500
 
 if __name__ == '__main__':
