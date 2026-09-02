@@ -3,21 +3,26 @@ import numpy as np
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 import os
+import logging
 
 app = Flask(__name__)
 
-# Configuración CORS que permite todo
 CORS(app, resources={r"/*": {"origins": "*"}})
 
-# --- RUTAS ---
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+PIPELINE_PATH = os.path.join(BASE_DIR, 'modelo/diabetes_pipeline.pkl')
 MODEL_PATH = os.path.join(BASE_DIR, 'modelo/random_forest_model.pkl')
 SCALER_PATH = os.path.join(BASE_DIR, 'modelo/scaler.pkl')
 
+pipeline = None
 model = None
 scaler = None
 
-# Mapeo de Español (React) -> Inglés (Modelo)
+CLASSIFICATION_THRESHOLD = 0.5
+
 KEYS_MAPPING = {
     'embarazos': 'Pregnancies',
     'glucosa': 'Glucose',
@@ -29,79 +34,111 @@ KEYS_MAPPING = {
     'edad': 'Age'
 }
 
-def load_model_and_scaler():
-    global model, scaler
-    try:
-        model = joblib.load(MODEL_PATH)
-        scaler = joblib.load(SCALER_PATH)
-        print("Modelos cargados correctamente.")
-    except Exception as e:
-        print(f"Error cargando modelos: {e}")
+EXPECTED_FEATURES = [
+    'Pregnancies', 'Glucose', 'BloodPressure',
+    'SkinThickness', 'Insulin', 'BMI',
+    'DiabetesPedigreeFunction', 'Age'
+]
 
-load_model_and_scaler()
+def load_models():
+    global pipeline, model, scaler
+    try:
+        if os.path.exists(PIPELINE_PATH):
+            pipeline = joblib.load(PIPELINE_PATH)
+            logger.info("Pipeline cargado correctamente.")
+        else:
+            model = joblib.load(MODEL_PATH)
+            scaler = joblib.load(SCALER_PATH)
+            logger.info("Modelo y scaler cargados por separado (compatibilidad).")
+    except Exception as e:
+        logger.error(f"Error cargando modelos: {e}")
+
+load_models()
 
 @app.route('/', methods=['GET'])
 def home():
-    return jsonify({"status": "API Online", "model_loaded": model is not None})
+    return jsonify({
+        "status": "API Online",
+        "pipeline_loaded": pipeline is not None,
+        "model_loaded": model is not None,
+        "threshold": CLASSIFICATION_THRESHOLD
+    })
 
 @app.route('/predict', methods=['POST'])
 def predict():
-    if not model or not scaler:
+    if not pipeline and not model:
         return jsonify({"error": "Modelo no cargado en el servidor"}), 500
 
     try:
         data = request.get_json(force=True)
-        
-        # --- 1. TRADUCCIÓN Y EXTRACCIÓN (DEBUG) ---
-        data_processed = {}
-        missing_keys = []
-        
-        # Lista exacta que espera el modelo (en orden)
-        expected_features = ['Pregnancies', 'Glucose', 'BloodPressure', 'SkinThickness', 'Insulin', 'BMI', 'DiabetesPedigreeFunction', 'Age']
 
-        # Traducimos lo que llega
-        for key, value in data.items():
-            english_key = KEYS_MAPPING.get(key, key) # Si existe en el mapa lo traduce, sino usa la llave original
-            data_processed[english_key] = float(value) # Aseguramos que sea número
-
-        # Verificamos si falta algo
         values_list = []
-        for feature in expected_features:
-            if feature not in data_processed:
-                missing_keys.append(feature)
-                values_list.append(0.0) # Rellenar con 0 para que no explote
-            else:
-                values_list.append(data_processed[feature])
+        debug_received = data
+        debug_interpreted = {}
 
-        # --- 2. PREDICCIÓN ---
-        # Convertimos a formato lista de listas (2D array)
-        input_data = [values_list] 
-        
-        # Escalamos
-        scaled_input = scaler.transform(input_data)
-        
-        # Predecimos
-        prediction_class = model.predict(scaled_input)[0]       # Clase: 0 o 1
-        prediction_prob = model.predict_proba(scaled_input)[0]  # Probabilidad: [0.2, 0.8]
+        for feature in EXPECTED_FEATURES:
+            esp_key = None
+            for k, v in KEYS_MAPPING.items():
+                if v == feature:
+                    esp_key = k
+                    break
 
-        # Tomamos la probabilidad de que sea POSITIVO (Diabetes)
-        probabilidad_diabetes = float(prediction_prob[1])
+            value = data.get(feature) or data.get(esp_key)
+            if value is None:
+                logger.warning(f"Feature {feature} faltante, usando 0.0")
+                value = 0.0
 
-        result = {
-            "prediction": int(prediction_class),      # 0 o 1
-            "resultado": probabilidad_diabetes,       # 0.85 (Esto es lo que quiere React)
+            values_list.append(float(value))
+            debug_interpreted[feature] = float(value)
+
+        try:
+            import pandas as pd
+            input_data = pd.DataFrame([values_list], columns=EXPECTED_FEATURES)
+        except ImportError:
+            input_data = np.array([values_list])
+
+        if pipeline:
+            prediction_class = pipeline.predict(input_data)[0]
+            prediction_prob = pipeline.predict_proba(input_data)[0]
+        else:
+            if model is None or scaler is None:
+                return jsonify({"error": "Modelo o scaler no cargados"}), 500
+            scaled = scaler.transform(input_data)
+            prediction_class = model.predict(scaled)[0]
+            prediction_prob = model.predict_proba(scaled)[0]
+
+        prob_diabetes = float(prediction_prob[1])
+        prob_no_diabetes = float(prediction_prob[0])
+        result_class = 1 if prob_diabetes >= CLASSIFICATION_THRESHOLD else 0
+        diagnosis = "Diabetes" if result_class == 1 else "No Diabetes"
+
+        return jsonify({
+            "prediction": result_class,
+            "resultado": prob_diabetes,
+            "probability_diabetes": prob_diabetes,
+            "probability_no_diabetes": prob_no_diabetes,
+            "diagnosis": diagnosis,
+            "threshold_used": CLASSIFICATION_THRESHOLD,
             "message": "Predicción exitosa",
-            
-            # DATOS DE DEBUG (Para ver qué está llegando)
-            "debug_received": data,                   # Lo que envió React
-            "debug_interpreted": data_processed,      # Lo que entendió Python
-            "debug_missing": missing_keys             # Lo que faltó
-        }
-
-        return jsonify(result), 200
+            "debug_received": debug_received,
+            "debug_interpreted": debug_interpreted,
+        }), 200
 
     except Exception as e:
+        logger.error(f"Error en predicción: {e}")
         return jsonify({"error": f"Error interno: {str(e)}"}), 500
+
+@app.route('/metrics', methods=['GET'])
+def metrics_info():
+    return jsonify({
+        "model_type": "RandomForestClassifier",
+        "metrics_required": [
+            "Accuracy", "Sensitivity/Recall", "Specificity",
+            "PPV/Precision", "NPV", "F1-Score", "ROC-AUC",
+            "Brier Score", "Confusion Matrix"
+        ],
+        "note": "Las metricas se calculan en el script de evaluacion, no en la API."
+    })
 
 if __name__ == '__main__':
     app.run(debug=True, host='0.0.0.0', port=5000)

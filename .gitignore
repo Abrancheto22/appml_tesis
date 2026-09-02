@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+.DS_Store
+*.zip
+.pyrefly.toml
+diabetes_012_health_indicators_BRFSS2015.csv
